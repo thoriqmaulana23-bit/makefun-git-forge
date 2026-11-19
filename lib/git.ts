@@ -11,8 +11,10 @@ export const ZERO_OID = '0000000000000000000000000000000000000000';
 export function pktLine(s: string | Buffer): Buffer {
   const payload = typeof s === 'string' ? Buffer.from(s, 'utf8') : s;
   const len = payload.length + 4;
-  const head = Buffer.from(len.toString(16).padStart(4, '0'), 'utf8');
-  return Buffer.concat([head, payload]);
+  const out = Buffer.allocUnsafe(len);
+  out.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  payload.copy(out, 4);
+  return out;
 }
 export const FLUSH = Buffer.from('0000', 'utf8');
 
@@ -177,27 +179,28 @@ export function parsePack(buf: Buffer): ParsedObject[] {
         negOff = ((negOff + 1) << 7) | (b & 0x7f);
       }
       const baseOff = start - negOff;
-      const inflated = inflateSync(buf.subarray(pos));
-      pos += inflatedConsumed(buf, pos);
+      const inflated = inflateAt(buf, pos);
+      pos = inflated.next;
       const base = byOffset.get(baseOff);
       if (!base) throw new Error('ofs-delta base missing');
-      data = applyDelta(base.data, inflated);
+      data = applyDelta(base.data, inflated.data);
       type = base.type;
     } else if (typeNum === 7) { // REF_DELTA
       const baseSha = buf.subarray(pos, pos + 20).toString('hex'); pos += 20;
-      const inflated = inflateSync(buf.subarray(pos));
-      pos += inflatedConsumed(buf, pos);
+      const inflated = inflateAt(buf, pos);
+      pos = inflated.next;
       const base = out.find((o) => o.sha === baseSha);
       if (!base) throw new Error('ref-delta base missing');
-      data = applyDelta(base.data, inflated);
+      data = applyDelta(base.data, inflated.data);
       type = base.type;
     } else {
       type = TYPE_NAMES[typeNum] as string;
-      data = inflateSync(buf.subarray(pos));
-      pos += inflatedConsumed(buf, pos);
+      const inflated = inflateAt(buf, pos);
+      data = inflated.data;
+      pos = inflated.next;
     }
     const head = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-    const sha = createHash('sha1').update(Buffer.concat([head, data])).digest('hex');
+    const sha = createHash('sha1').update(head).update(data).digest('hex');
     const obj: ParsedObject = { type, data, sha };
     out.push(obj);
     byOffset.set(start, obj);
@@ -205,23 +208,17 @@ export function parsePack(buf: Buffer): ParsedObject[] {
   return out;
 }
 
-// How many bytes of `buf` starting at `pos` does the zlib stream consume?
-// inflateSync ignores trailing bytes but throws on a truncated stream, so the
-// smallest prefix that inflates cleanly is exactly the stream's length.
-function inflatedConsumed(buf: Buffer, pos: number): number {
-  inflateSync(buf.subarray(pos)); // throws if the stream itself is bad
-  let lo = 1;
-  let hi = buf.length - pos;
-  let ans = hi;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(buf.subarray(pos, pos + mid));
-      ans = mid;
-      hi = mid - 1;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  return ans;
+/** Inflate one zlib stream at `pos`; returns its bytes and the offset just past the stream. */
+function inflateAt(buf: Buffer, pos: number): { data: Buffer; next: number } {
+  // inflateSync(..., { info: true }) reports the input bytes the engine consumed
+  // as engine.bytesWritten, so one inflate gives both the data and the stream's
+  // length — no binary search over prefixes (which re-inflated ~log2(n) times
+  // and threw a stack-capturing error on every too-short prefix).
+  const result = inflateSync(buf.subarray(pos), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  const written = result.engine.bytesWritten;
+  if (!written || written <= 0) throw new Error('zlib stream consumed no bytes');
+  return { data: result.buffer, next: pos + written };
 }

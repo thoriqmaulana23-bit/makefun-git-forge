@@ -11,7 +11,7 @@ export interface RestCtx {
   base: string; // e.g. http://127.0.0.1:1234
 }
 
-export interface RestResult { status: number; body: unknown; headers?: Record<string, string>; }
+export interface RestResult { status: number; body: unknown; headers?: Record<string, string>; bodyText?: string }
 
 let requestSeq = 0;
 export function nextRequestId(): string {
@@ -82,8 +82,7 @@ function labelJson(repo: Repo, name: string): Record<string, unknown> {
   };
 }
 
-export function issueJson(repo: Repo, issue: Issue, base: string): Record<string, unknown> {
-  return {
+export function issueJson(repo: Repo, issue: Issue, base: string): Record<string, unknown> {  return {
     id: issue.id, node_id: globalId('Issue', repo.id, issue.number),
     number: issue.number, title: issue.title, body: issue.body, state: issue.state,
     labels: issue.labels.map((n) => labelJson(repo, n)),
@@ -95,6 +94,39 @@ export function issueJson(repo: Repo, issue: Issue, base: string): Record<string
     url: `${base}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
     repository_url: `${base}/api/v3/repos/${repo.owner}/${repo.name}`,
   };
+}
+
+// --- cached single-issue JSON (the read workload's hot path) ----------------
+// A GET of one issue serializes the same object on every call: the bytes only
+// change when the issue itself changes (PATCH, or a comment arriving, which
+// changes the comments count) or when `base` (the request host) changes. The
+// cache is keyed by the repo object (WeakMap: a deleted repo's entries are
+// collected) and by base+number, and is invalidated on exactly those two
+// mutations. The cached text is byte-identical to JSON.stringify(issueJson())
+// plus the trailing newline sendJson appends, so the response is unchanged.
+const issueJsonCache = new WeakMap<Repo, Map<string, string>>();
+
+function cachedIssueJsonText(repo: Repo, issue: Issue, base: string): string {
+  const key = `${base}\n${issue.number}`;
+  let perRepo = issueJsonCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map<string, string>();
+    issueJsonCache.set(repo, perRepo);
+  }
+  let text = perRepo.get(key);
+  if (text === undefined) {
+    text = `${JSON.stringify(issueJson(repo, issue, base))}\n`;
+    if (perRepo.size >= 1024) perRepo.clear();
+    perRepo.set(key, text);
+  }
+  return text;
+}
+
+function invalidateIssueJson(repo: Repo, issue: Issue): void {
+  const perRepo = issueJsonCache.get(repo);
+  if (perRepo === undefined) return;
+  const suffix = `\n${issue.number}`;
+  for (const key of [...perRepo.keys()]) if (key.endsWith(suffix)) perRepo.delete(key);
 }
 
 function commitJson(repo: Repo, sha: string): Record<string, unknown> | null {
@@ -459,7 +491,7 @@ export function handleRest(ctx: RestCtx): RestResult {
       const issue = repo.issueByNum.get(num);
       if (rest.length === 2) {
         if (!issue) return err(404, 'Not Found');
-        if (m === 'GET') return ok(200, issueJson(repo, issue, ctx.base));
+        if (m === 'GET') return { status: 200, body: null, bodyText: cachedIssueJsonText(repo, issue, ctx.base) };
         if (m === 'PATCH') {
           if (body.state === 'closed' || body.state === 'open') issue.state = body.state;
           if (typeof body.title === 'string') issue.title = body.title;
@@ -470,6 +502,7 @@ export function handleRest(ctx: RestCtx): RestResult {
             issue.labels = labels;
           }
           issue.updated_at = nowIso();
+          invalidateIssueJson(repo, issue);
           return ok(200, issueJson(repo, issue, ctx.base));
         }
         return err(404, 'Not Found');
@@ -481,6 +514,7 @@ export function handleRest(ctx: RestCtx): RestResult {
           repo.nextComment += 1;
           const comment = { id, body: str(body.body), created_at: nowIso(), updated_at: nowIso() };
           issue.comments.push(comment);
+          invalidateIssueJson(repo, issue);
           return ok(201, { id, node_id: globalId('Comment', repo.id, issue.number, id), body: comment.body, user: { login: OWNER_LOGIN, id: OWNER_ID, type: 'User' }, created_at: comment.created_at, updated_at: comment.updated_at, html_url: `https://github.com/${owner}/${name}/issues/${num}#issuecomment-${id}` });
         }
         if (m === 'GET') {

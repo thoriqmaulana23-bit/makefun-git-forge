@@ -17,17 +17,29 @@ function authed(req: IncomingMessage): boolean {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const text = body === null ? '' : `${JSON.stringify(body)}\n`;
+  const buf = body === null ? null : Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
   const headers: Record<string, string> = {
     'x-github-request-id': nextRequestId(),
     ...extra,
   };
-  if (body !== null) {
+  if (buf !== null) {
     headers['content-type'] = JSON_TYPE;
-    headers['content-length'] = String(Buffer.byteLength(text));
+    headers['content-length'] = String(buf.length);
   }
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(buf ?? '');
+}
+
+/** Send an already-serialized JSON body byte-for-byte (the cached issue-read path). */
+function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  const buf = Buffer.from(text, 'utf8');
+  res.writeHead(status, {
+    'x-github-request-id': nextRequestId(),
+    'content-type': JSON_TYPE,
+    'content-length': String(buf.length),
+    ...extra,
+  });
+  res.end(buf);
 }
 
 function sendBytes(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
@@ -40,6 +52,17 @@ function sendBytes(res: ServerResponse, status: number, body: Buffer, contentTyp
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  // A request that cannot carry a body (a GET/HEAD/DELETE with no
+  // Content-Length and no chunked encoding — the read workload's 2,000 GETs)
+  // resolves at once instead of waiting a tick for the stream's 'end' event.
+  const len = req.headers['content-length'];
+  if (
+    (req.method === 'GET' || req.method === 'HEAD' || req.method === 'DELETE') &&
+    (len === undefined || len === '0') &&
+    req.headers['transfer-encoding'] === undefined
+  ) {
+    return Promise.resolve(Buffer.alloc(0));
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -54,12 +77,20 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function pathOf(req: IncomingMessage): string {
-  try {
-    const p = new URL(req.url ?? '/', 'http://entry').pathname;
-    return p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p;
-  } catch {
-    return '/';
-  }
+  // The request-target's path without its query string. new URL() here cost a
+  // full URL parse on every request; the path is just the part before '?'
+  // (percent-encoding is preserved, exactly as URL.pathname would keep it).
+  const u = req.url ?? '/';
+  const q = u.indexOf('?');
+  const p = q === -1 ? u : u.slice(0, q);
+  if (p === '') return '/';
+  return p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p;
+}
+
+function queryOf(req: IncomingMessage): URLSearchParams {
+  const u = req.url ?? '/';
+  const q = u.indexOf('?');
+  return new URLSearchParams(q === -1 ? '' : u.slice(q + 1));
 }
 
 export function createApp(): Server {
@@ -121,20 +152,21 @@ export function createApp(): Server {
             return;
           }
         }
-        let url: URL;
+        let url: URLSearchParams;
         try {
-          url = new URL(req.url ?? '/', 'http://entry');
+          url = queryOf(req);
         } catch {
           sendJson(res, 404, { message: 'Not Found' });
           return;
         }
         const base = `http://${req.headers.host ?? '127.0.0.1'}`;
-        const result = handleRest({ method, path, query: url.searchParams, body: parsed, base });
+        const result = handleRest({ method, path, query: url, body: parsed, base });
         if (result.status === 204) {
           res.writeHead(204, { 'x-github-request-id': nextRequestId() });
           res.end();
           return;
         }
+        if (result.bodyText !== undefined) { sendJsonText(res, result.status, result.bodyText, result.headers ?? {}); return; }
         sendJson(res, result.status, result.body, result.headers ?? {});
         return;
       }
@@ -148,10 +180,7 @@ export function createApp(): Server {
         const repo = store.getRepo(owner, repoName);
         const protocol2 = (req.headers['git-protocol'] ?? '') === 'version=2';
         if (service === 'info/refs') {
-          let serviceParam = '';
-          try {
-            serviceParam = new URL(req.url ?? '/', 'http://entry').searchParams.get('service') ?? '';
-          } catch { /* ignore */ }
+          const serviceParam = queryOf(req).get('service') ?? '';
           const out = handleInfoRefs(repo, serviceParam, protocol2);
           if (out.status === 404) { sendJson(res, 404, { message: 'Not Found' }); return; }
           sendBytes(res, out.status, out.body, out.contentType);

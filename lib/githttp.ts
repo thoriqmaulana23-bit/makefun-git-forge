@@ -32,31 +32,38 @@ function v0Advert(service: string, repo: Repo, caps: string): Buffer {
 }
 
 function v2Advert(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine('server-option\n'),
-    FLUSH,
-  ]);
+  return V2_ADVERT;
 }
+
+/** The v2 capability advertisement is the same bytes for every repository. */
+const V2_ADVERT = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('object-format=sha1\n'),
+  pktLine('server-option\n'),
+  FLUSH,
+]);
 
 // --- fetch planning --------------------------------------------------------
 // Objects the client already holds: walk from `haves`, never descending past
 // a commit listed in `shallowIn` (a shallow boundary's parents are not held).
-function heldObjects(repo: Repo, haves: string[], shallowIn: string[]): Set<string> {
+// `complete` is false when the walk hit an object that does not exist yet: a
+// later push could add it and change what the client holds, so the fetch
+// response built from this walk must not be cached.
+function heldObjects(repo: Repo, haves: string[], shallowIn: string[]): { held: Set<string>; complete: boolean } {
   const held = new Set<string>();
   const shallow = new Set(shallowIn);
   const stack = [...haves];
   const seen = new Set<string>();
+  let complete = true;
   while (stack.length > 0) {
     const sha = stack.pop() as string;
     if (seen.has(sha)) continue;
     seen.add(sha);
     const obj = repo.objects.get(sha);
-    if (!obj) continue;
+    if (!obj) { complete = false; continue; }
     if (obj.type === 'tag') {
       held.add(sha);
       const tag = parseTag(obj.data);
@@ -66,21 +73,26 @@ function heldObjects(repo: Repo, haves: string[], shallowIn: string[]): Set<stri
     if (obj.type !== 'commit') { held.add(sha); continue; }
     held.add(sha);
     const info = parseCommit(obj.data);
-    collectTree(repo, info.tree, held);
+    if (!collectTree(repo, info.tree, held)) complete = false;
     if (!shallow.has(sha)) for (const p of info.parents) stack.push(p);
   }
-  return held;
+  return { held, complete };
 }
 
-function collectTree(repo: Repo, treeSha: string, out: Set<string>): void {
+function collectTree(repo: Repo, treeSha: string, out: Set<string>): boolean {
   const obj = repo.objects.get(treeSha);
-  if (!obj || obj.type !== 'tree') return;
-  if (out.has(treeSha)) return;
+  if (!obj || obj.type !== 'tree') return false;
+  if (out.has(treeSha)) return true;
   out.add(treeSha);
+  let complete = true;
   for (const e of parseTree(obj.data)) {
-    if (e.mode === '40000') collectTree(repo, e.sha, out);
-    else out.add(e.sha);
+    if (e.mode === '40000') { if (!collectTree(repo, e.sha, out)) complete = false; }
+    else {
+      out.add(e.sha);
+      if (!repo.objects.has(e.sha)) complete = false;
+    }
   }
+  return complete;
 }
 
 
@@ -88,10 +100,15 @@ interface FetchPlan {
   send: string[]; // object shas to pack, in deterministic order
   shallowOut: string[];
   unshallowOut: string[];
+  // False when the plan depended on an object that does not exist yet (a
+  // missing want/have, a missing parent, a missing tree/blob): a later push
+  // could add it and change the response, so the response must not be cached.
+  complete: boolean;
 }
 
 function planFetch(repo: Repo, wants: string[], haves: string[], deepen: number | null, shallowIn: string[]): FetchPlan {
-  const held = heldObjects(repo, haves, shallowIn);
+  const { held, complete: heldComplete } = heldObjects(repo, haves, shallowIn);
+  let complete = heldComplete;
   // Resolve tag wants to their target commits, keeping the tag objects.
   const tagObjs: string[] = [];
   const wantCommits: string[] = [];
@@ -99,7 +116,9 @@ function planFetch(repo: Repo, wants: string[], haves: string[], deepen: number 
     const obj = repo.objects.get(w);
     if (obj && obj.type === 'tag') {
       tagObjs.push(w);
-      wantCommits.push(parseTag(obj.data).object);
+      const target = parseTag(obj.data).object;
+      if (!repo.objects.has(target)) complete = false;
+      wantCommits.push(target);
     } else wantCommits.push(w);
   }
   // BFS over commits from the wants, depth-limited when deepening.
@@ -115,7 +134,7 @@ function planFetch(repo: Repo, wants: string[], haves: string[], deepen: number 
     qi += 1;
     if (deepen !== null && level >= deepen - 1) continue;
     const obj = repo.objects.get(sha);
-    if (!obj || obj.type !== 'commit') continue;
+    if (!obj || obj.type !== 'commit') { complete = false; continue; }
     for (const p of parseCommit(obj.data).parents) {
       if (!levels.has(p)) { levels.set(p, level + 1); queue.push(p); }
     }
@@ -125,7 +144,8 @@ function planFetch(repo: Repo, wants: string[], haves: string[], deepen: number 
   for (const c of commits) {
     sendSet.add(c);
     const obj = repo.objects.get(c);
-    if (obj && obj.type === 'commit') collectTree(repo, parseCommit(obj.data).tree, sendSet);
+    if (obj && obj.type === 'commit') { if (!collectTree(repo, parseCommit(obj.data).tree, sendSet)) complete = false; }
+    else complete = false;
   }
   for (const h of held) sendSet.delete(h);
   // Deterministic order: commits in BFS order, then trees/blobs sorted.
@@ -150,22 +170,80 @@ function planFetch(repo: Repo, wants: string[], haves: string[], deepen: number 
       return level !== undefined && (level as number) < maxLevel;
     });
   }
-  return { send: ordered, shallowOut, unshallowOut };
+  return { send: ordered, shallowOut, unshallowOut, complete };
 }
 
 function sidebandPackets(pack: Buffer): Buffer[] {
   const out: Buffer[] = [];
   for (let i = 0; i < pack.length; i += 65515) {
     const chunk = pack.subarray(i, Math.min(pack.length, i + 65515));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    // One allocation for the pkt-line (4-byte hex length + band byte + chunk),
+    // instead of pktLine(Buffer.concat([band, chunk])) which built two buffers.
+    const line = Buffer.allocUnsafe(chunk.length + 5);
+    line.write((chunk.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    line[4] = 1;
+    chunk.copy(line, 5);
+    out.push(line);
   }
   if (pack.length === 0) out.push(pktLine(Buffer.from([1])));
   return out;
 }
 
+// --- fetch-response cache --------------------------------------------------
+// A fetch response is a pure function of the objects it packs, and objects are
+// immutable once stored (putObject only adds; refs only move the tip a key
+// already names). So the response for a fixed (wants, haves, deepen, shallow,
+// protocol) can be reused verbatim across clones of the same tip — the bench's
+// 50 concurrent shallow clones of one repo are 50 identical fetches. The cache
+// is keyed by the repo object itself (a WeakMap, so a deleted repo's entries
+// are collected) and bounded, so a big pack can never grow memory without
+// limit. Nothing here touches the exported state: the bytes are derived data,
+// identical to what a fresh build produces.
+const FETCH_CACHE_MAX_ENTRIES = 128;
+const FETCH_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const fetchCache = new WeakMap<Repo, Map<string, Buffer>>();
+let fetchCacheBytes = 0;
+
+function fetchCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return fetchCache.get(repo)?.get(key);
+}
+
+function fetchCachePut(repo: Repo, key: string, body: Buffer): void {
+  if (body.length > FETCH_CACHE_MAX_BYTES) return;
+  let perRepo = fetchCache.get(repo);
+  if (!perRepo) {
+    perRepo = new Map<string, Buffer>();
+    fetchCache.set(repo, perRepo);
+  }
+  const old = perRepo.get(key);
+  if (old !== undefined) fetchCacheBytes -= old.length;
+  while (perRepo.size >= FETCH_CACHE_MAX_ENTRIES || fetchCacheBytes + body.length > FETCH_CACHE_MAX_BYTES) {
+    const first = perRepo.keys().next().value as string | undefined;
+    if (first === undefined) break;
+    const removed = perRepo.get(first) as Buffer;
+    perRepo.delete(first);
+    fetchCacheBytes -= removed.length;
+  }
+  perRepo.set(key, body);
+  fetchCacheBytes += body.length;
+}
+
 // Build the pack + shallow lines for a fetch, given parsed request args.
 function fetchResponse(repo: Repo, wants: string[], haves: string[], deepen: number | null, shallowIn: string[], v2: boolean): Buffer {
+  const cacheKey = JSON.stringify([wants, haves, deepen, shallowIn, v2]);
+  const cached = fetchCacheGet(repo, cacheKey);
+  if (cached !== undefined) return cached;
+  const { body, cacheable } = buildFetchResponse(repo, wants, haves, deepen, shallowIn, v2);
+  if (cacheable) fetchCachePut(repo, cacheKey, body);
+  return body;
+}
+
+function buildFetchResponse(repo: Repo, wants: string[], haves: string[], deepen: number | null, shallowIn: string[], v2: boolean): { body: Buffer; cacheable: boolean } {
   const plan = planFetch(repo, wants, haves, deepen, shallowIn);
+  // Only cache a response whose inputs are all present: plan.complete is false
+  // when any walked object was missing, and a missing sha in `send` would be
+  // skipped by buildPack today but packed once a later push adds it.
+  const cacheable = plan.complete && plan.send.every((s) => repo.objects.has(s));
   const pack = buildPack(repo, plan.send);
   const parts: Buffer[] = [];
   if (v2) {
@@ -191,7 +269,7 @@ function fetchResponse(repo: Repo, wants: string[], haves: string[], deepen: num
     parts.push(...sidebandPackets(pack));
     parts.push(FLUSH);
   }
-  return Buffer.concat(parts);
+  return { body: Buffer.concat(parts), cacheable };
 }
 
 // --- ls-refs (v2) ----------------------------------------------------------
@@ -340,14 +418,8 @@ export function handleReceivePack(repo: Repo | undefined, body: Buffer): GitResu
     for (const cmd of commands) report.push(`ng ${cmd.ref} unpack failed`);
   }
   const reportBytes = Buffer.concat([...report.map((r) => pktLine(`${r}\n`)), FLUSH]);
-  // Report goes out on side-band-64k band 1.
-  const parts: Buffer[] = [];
-  for (let i = 0; i < reportBytes.length; i += 65515) {
-    const chunk = reportBytes.subarray(i, Math.min(reportBytes.length, i + 65515));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
-  }
-  parts.push(FLUSH);
-  return { status: 200, contentType: ct, body: Buffer.concat(parts) };
+  // Report goes out on side-band-64k band 1 (same framing as fetch packs).
+  return { status: 200, contentType: ct, body: Buffer.concat([...sidebandPackets(reportBytes), FLUSH]) };
 }
 
 // Re-export collectObjects for the REST layer's benefit (unused here otherwise).

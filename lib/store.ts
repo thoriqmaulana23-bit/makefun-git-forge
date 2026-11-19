@@ -34,7 +34,9 @@ export function sha1(buf: Buffer): string {
 
 export function hashObject(type: ObjType, data: Buffer): string {
   const head = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1(Buffer.concat([head, data]));
+  // Stream the header and the data into the hash: the old Buffer.concat copied
+  // the whole object (a 1 KiB blob on every push) just to hash it.
+  return createHash('sha1').update(head).update(data).digest('hex');
 }
 
 export interface TreeEntry { mode: string; name: string; sha: string; }
@@ -218,7 +220,23 @@ export class Store {
 
   isAncestor(repo: Repo, anc: string, desc: string): boolean {
     if (anc === desc) return true;
-    return this.ancestors(repo, desc).includes(anc);
+    // Walk from `desc` and stop as soon as `anc` is found. The old code walked
+    // the ENTIRE history first (ancestors() parses every commit back to the
+    // root) and only then checked membership — O(history) on every push, so a
+    // 600-push chain paid ~180k commit parses. A push's old ref is normally the
+    // immediate parent, so this is usually one step.
+    const seen = new Set<string>();
+    const stack = [desc];
+    while (stack.length > 0) {
+      const sha = stack.pop() as string;
+      if (sha === anc) return true;
+      if (seen.has(sha)) continue;
+      seen.add(sha);
+      const obj = repo.objects.get(sha);
+      if (!obj || obj.type !== 'commit') continue;
+      for (const p of parseCommit(obj.data).parents) stack.push(p);
+    }
+    return false;
   }
 
   mergeBase(repo: Repo, a: string, b: string): string | null {
@@ -304,9 +322,10 @@ export class Store {
   createIssue(repo: Repo, title: string, body: string, labels: string[]): Issue {
     const n = repo.nextIssue;
     repo.nextIssue += 1;
+    const stamp = nowIso();
     const issue: Issue = {
       id: this.nextIssueId, number: n, title, body, state: 'open',
-      labels: [...labels], comments: [], created_at: nowIso(), updated_at: nowIso(), seq: this.seq(),
+      labels: [...labels], comments: [], created_at: stamp, updated_at: stamp, seq: this.seq(),
     };
     this.nextIssueId += 1;
     repo.issues.push(issue);
